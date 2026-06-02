@@ -19,7 +19,7 @@ and keep the model cache on a retained EBS volume so the next launch is fast.
 ```bash
 # 1. Fill in your account-specific config
 cp launch.env.example launch.env
-$EDITOR launch.env          # key pair, subnet, security group, AMI, email, webhookv
+$EDITOR launch.env          # key pair, subnet, security group, AMI, email, webhook
 
 # 2. One-time AWS setup (IAM role, instance profile, SNS topic + email sub)
 ./launch_qwen_spot.sh --setup
