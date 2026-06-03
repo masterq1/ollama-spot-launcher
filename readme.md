@@ -25,11 +25,20 @@ $EDITOR launch.env          # key pair, subnet, security group, AMI, email, webh
 ./launch_qwen_spot.sh --setup
 # Confirm the SNS subscription email before launching.
 
-# 3. Launch
+# 3. (Optional) Check spot availability before spending — ranks AZs by
+#    AWS Spot Placement Score (1-10) with current price; no launch.
+./launch_qwen_spot.sh --check-spot
+./launch_qwen_spot.sh --check-spot --region us-east-2
+
+# 4. Launch
 ./launch_qwen_spot.sh                 # spot, us-east-1 (default)
 ./launch_qwen_spot.sh --ondemand      # on-demand instead of spot
 ./launch_qwen_spot.sh --region us-east-2
+./launch_qwen_spot.sh --auto-az       # pick the best-scoring AZ's subnet automatically
 ```
+
+`--auto-az` selects a subnet in the highest-scoring AZ from the **same VPC** as
+your configured `SUBNET_ID`, so no per-AZ subnet config is required.
 
 When the model is ready the launcher prints the Ollama URL **and the Web UI
 URL**, and writes `OLLAMA_API_BASE` to `~/.aider.env`.

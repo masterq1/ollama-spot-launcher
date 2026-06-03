@@ -19,6 +19,13 @@
 # On-demand launch:
 #   ./launch_qwen_spot.sh --ondemand
 #   ./launch_qwen_spot.sh --ondemand --region us-east-2
+#
+# Check spot availability (no launch) — ranks AZs by fulfillment likelihood:
+#   ./launch_qwen_spot.sh --check-spot
+#   ./launch_qwen_spot.sh --check-spot --region us-east-2
+#
+# Auto-pick the best-scoring AZ's subnet for the launch:
+#   ./launch_qwen_spot.sh --auto-az
 # =============================================================================
 
 set -euo pipefail
@@ -29,15 +36,19 @@ set -euo pipefail
 LAUNCH_MODE="spot"
 REGION="us-east-1"
 DO_SETUP=false
+DO_CHECK_SPOT=false
+AUTO_AZ=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ondemand)  LAUNCH_MODE="ondemand"; shift ;;
-        --spot)      LAUNCH_MODE="spot"; shift ;;
-        --setup)     DO_SETUP=true; shift ;;
-        --region)    REGION="$2"; shift 2 ;;
-        --region=*)  REGION="${1#--region=}"; shift ;;
-        *)           echo "Unknown option: $1"; exit 1 ;;
+        --ondemand)   LAUNCH_MODE="ondemand"; shift ;;
+        --spot)       LAUNCH_MODE="spot"; shift ;;
+        --setup)      DO_SETUP=true; shift ;;
+        --check-spot) DO_CHECK_SPOT=true; shift ;;
+        --auto-az)    AUTO_AZ=true; shift ;;
+        --region)     REGION="$2"; shift 2 ;;
+        --region=*)   REGION="${1#--region=}"; shift ;;
+        *)            echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -84,6 +95,105 @@ case "$REGION" in
         exit 1
         ;;
 esac
+
+# ---------------------------------------------------------------------------
+# SPOT AVAILABILITY CHECK  (--check-spot / --auto-az)
+# Ranks AZs in $REGION for $INSTANCE_TYPE by Spot Placement Score (AWS's
+# likelihood-of-fulfillment metric, 1=worst .. 10=best), annotated with the
+# current spot price and whether the AZ even offers the type. Read-only, free.
+# rank_spot_azs() emits one "name<TAB>score<TAB>price<TAB>offered" row per AZ,
+# sorted score-desc then price-asc. check_spot() prints it and sets BEST_AZ to
+# the top offered AZ.
+# ---------------------------------------------------------------------------
+BEST_AZ=""
+
+rank_spot_azs() {
+    local itype="$1"
+
+    # AZ id <-> name map (per account/region) so we can join SPS (ids) to prices (names).
+    local az_map offered sps prices
+    az_map=$(aws ec2 describe-availability-zones --region "$REGION" \
+        --query 'AvailabilityZones[].[ZoneId,ZoneName]' --output text 2>/dev/null || true)
+
+    # AZs (zone names) that actually offer the instance type.
+    offered=$(aws ec2 describe-instance-type-offerings --region "$REGION" \
+        --location-type availability-zone \
+        --filters "Name=instance-type,Values=${itype}" \
+        --query 'InstanceTypeOfferings[].Location' --output text 2>/dev/null || true)
+
+    # Spot Placement Score per single AZ (returns AZ IDs).
+    sps=$(aws ec2 get-spot-placement-scores --region "$REGION" \
+        --instance-types "$itype" \
+        --target-capacity 1 --target-capacity-unit-type units \
+        --single-availability-zone \
+        --region-names "$REGION" \
+        --query 'SpotPlacementScores[].[AvailabilityZoneId,Score]' --output text 2>/dev/null || true)
+
+    # Latest spot price per AZ name.
+    prices=$(aws ec2 describe-spot-price-history --region "$REGION" \
+        --instance-types "$itype" --product-descriptions "Linux/UNIX" \
+        --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --query 'SpotPriceHistory[].[AvailabilityZone,SpotPrice]' --output text 2>/dev/null || true)
+
+    printf '%s\n' "$sps" | awk -v azmap="$az_map" -v offered="$offered" -v prices="$prices" '
+        BEGIN {
+            n=split(azmap, a, /[ \t\n]+/);  for(i=1;i<=n;i+=2) id2name[a[i]]=a[i+1];
+            n=split(offered, o, /[ \t\n]+/); for(i=1;i<=n;i++)   off[o[i]]=1;
+            n=split(prices, p, /[ \t\n]+/);  for(i=1;i<=n;i+=2)  price[p[i]]=p[i+1];
+        }
+        $1!="" {
+            name=id2name[$1]; if(name=="") name=$1;
+            pr=(name in price)?price[name]:"-";
+            ofr=(name in off)?"yes":"no";
+            printf "%s\t%s\t%s\t%s\n", name, $2, pr, ofr;
+        }
+    ' | sort -t"$(printf '\t')" -k2,2nr -k3,3n
+}
+
+check_spot() {
+    echo ""
+    echo "Spot availability — ${INSTANCE_TYPE} in ${REGION}  (score 1-10, higher = more likely to fill)"
+    printf "  %-16s %-6s %-12s %-8s\n" "AZ" "SCORE" "PRICE/hr" "OFFERED"
+    printf "  %-16s %-6s %-12s %-8s\n" "----------------" "-----" "------------" "-------"
+    local found=0
+    while IFS=$'\t' read -r az score price ofr; do
+        [[ -z "$az" ]] && continue
+        printf "  %-16s %-6s %-12s %-8s\n" "$az" "$score" "$price" "$ofr"
+        if [[ "$found" -eq 0 && "$ofr" == "yes" ]]; then BEST_AZ="$az"; found=1; fi
+    done < <(rank_spot_azs "$INSTANCE_TYPE")
+    echo ""
+    if [[ -n "$BEST_AZ" ]]; then
+        echo "  Best bet: ${BEST_AZ}  (your cap SPOT_MAX_PRICE=\$${SPOT_MAX_PRICE}/hr)"
+    else
+        echo "  No scored/offered AZ returned. Check AWS creds, region, or that ${INSTANCE_TYPE} is available here."
+    fi
+    echo ""
+}
+
+# --check-spot: print the ranking and exit without launching anything.
+if [[ "$DO_CHECK_SPOT" == "true" ]]; then
+    check_spot
+    exit 0
+fi
+
+# --auto-az: rank AZs, then swap SUBNET_ID for a subnet in the best AZ that lives
+# in the SAME VPC as the configured subnet (no per-AZ subnet config needed).
+if [[ "$AUTO_AZ" == "true" ]]; then
+    check_spot
+    if [[ -n "$BEST_AZ" ]]; then
+        VPC_ID=$(aws ec2 describe-subnets --region "$REGION" --subnet-ids "$SUBNET_ID" \
+            --query 'Subnets[0].VpcId' --output text 2>/dev/null || true)
+        NEW_SUBNET=$(aws ec2 describe-subnets --region "$REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=availability-zone,Values=${BEST_AZ}" \
+            --query 'Subnets[0].SubnetId' --output text 2>/dev/null || true)
+        if [[ -n "$NEW_SUBNET" && "$NEW_SUBNET" != "None" ]]; then
+            echo "[$(date)] --auto-az: launching in ${BEST_AZ} via subnet ${NEW_SUBNET} (was ${SUBNET_ID})"
+            SUBNET_ID="$NEW_SUBNET"
+        else
+            echo "[$(date)] --auto-az: no subnet for ${BEST_AZ} in VPC ${VPC_ID}; keeping ${SUBNET_ID}"
+        fi
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # WEBHOOK CALLBACK CONFIG
@@ -195,6 +305,43 @@ if [[ -z "$SNS_TOPIC_ARN" || "$SNS_TOPIC_ARN" == "None" ]]; then
     echo "         Continuing without email — connect info will be in the bootstrap log."
     SNS_TOPIC_ARN=""
 fi
+
+# ---------------------------------------------------------------------------
+# WEBHOOK PREFLIGHT
+# Verifies the full callback path (NPM → localhost:WEBHOOK_PORT) before
+# spending money on an instance. Starts nc listener in background, POSTs
+# through the public URL, confirms 200 back and token received correctly.
+# ---------------------------------------------------------------------------
+echo "[$(date)] Webhook preflight: testing ${WEBHOOK_URL} → localhost:${WEBHOOK_PORT}..."
+_PREFLIGHT_TMP=$(mktemp)
+_HTTP_200=$'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{"ok":true}'
+
+# nc in background: writes raw HTTP request to temp file.
+( printf '%s' "$_HTTP_200" | nc -l -p "$WEBHOOK_PORT" -q 1 > "$_PREFLIGHT_TMP" 2>/dev/null ) &
+_NC_PID=$!
+sleep 1  # give nc time to bind
+
+_HTTP_CODE=$(curl -sf -m 10 -o /dev/null -w '%{http_code}' -X POST "$WEBHOOK_URL" \
+    -H "Content-Type: application/json" \
+    -H "X-Webhook-Token: ${WEBHOOK_SECRET}" \
+    -d '{"status":"preflight","instance_id":"local-test"}' 2>/dev/null || echo "000")
+
+wait "$_NC_PID" 2>/dev/null || true
+
+_RECV_TOKEN=$(grep -i '^X-Webhook-Token:' "$_PREFLIGHT_TMP" 2>/dev/null | tr -d '\r' | awk '{print $2}')
+rm -f "$_PREFLIGHT_TMP"
+
+if [[ "$_HTTP_CODE" != "200" ]]; then
+    echo "ERROR: Webhook preflight failed — got HTTP ${_HTTP_CODE} from ${WEBHOOK_URL}"
+    echo "  Check: NPM proxy for $(echo "$WEBHOOK_URL" | cut -d'/' -f3) → localhost:${WEBHOOK_PORT}"
+    exit 1
+fi
+if [[ "$_RECV_TOKEN" != "$WEBHOOK_SECRET" ]]; then
+    echo "ERROR: Webhook preflight — token mismatch (received: '${_RECV_TOKEN}')"
+    exit 1
+fi
+echo "[$(date)] Webhook preflight OK."
+echo ""
 
 # ---------------------------------------------------------------------------
 # ENCODE USERDATA
