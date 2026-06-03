@@ -58,8 +58,9 @@ done
 #   EBS root volume : EBS_SIZE_GB, EBS_TYPE, EBS_IOPS, EBS_THROUGHPUT,
 #                     EBS_DELETE_ON_TERMINATION
 #   Webhook         : WEBHOOK_PORT, WEBHOOK_WAIT_MAX, WEBHOOK_SECRET_FILE
-#   Account-specific: KEY_PAIR/SECURITY_GROUP_ID/SUBNET_ID/AMI_ID per region,
+#   Account-specific: KEY_PAIR/SECURITY_GROUP_ID/SUBNET_ID per region,
 #                     INSTANCE_PROFILE, NOTIFY_EMAIL, SNS_TOPIC_NAME, WEBHOOK_URL
+#   AMI IDs (public, non-PII) live in this script, keyed by region — not env.
 # ---------------------------------------------------------------------------
 LAUNCH_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/launch.env"
 if [[ ! -f "$LAUNCH_ENV" ]]; then
@@ -76,25 +77,35 @@ else
     EBS_FATE_DESC="retained on termination"
 fi
 
-# Select region-specific infrastructure vars.
+# Select region-specific account vars (PII) from launch.env.
 case "$REGION" in
     us-east-1)
         KEY_PAIR="${KEY_PAIR_USE1}"
         SECURITY_GROUP_ID="${SECURITY_GROUP_ID_USE1}"
-        SUBNET_ID="${SUBNET_ID_USE1}"
-        AMI_ID="${AMI_ID_USE1}"
+        SUBNET_ID="${SUBNET_ID_USE1}"          # us-east-1d (subnet-04bb1b2a)
         ;;
     us-east-2)
         KEY_PAIR="${KEY_PAIR_USE2}"
         SECURITY_GROUP_ID="${SECURITY_GROUP_ID_USE2}"
         SUBNET_ID="${SUBNET_ID_USE2}"
-        AMI_ID="${AMI_ID_USE2}"
         ;;
     *)
-        echo "ERROR: Region '$REGION' not configured. Add KEY_PAIR/SECURITY_GROUP_ID/SUBNET_ID/AMI_ID _USE* vars to launch.env."
+        echo "ERROR: Region '$REGION' not configured. Add KEY_PAIR/SECURITY_GROUP_ID/SUBNET_ID _USE* vars to launch.env, and an AMI mapping below."
         exit 1
         ;;
 esac
+
+# ---------------------------------------------------------------------------
+# AMI IDs  (public images — NOT PII, kept in code rather than launch.env)
+# g5.xlarge Qwen3-32B base AMI per region.
+# ---------------------------------------------------------------------------
+case "$REGION" in
+    us-east-1) AMI_ID="ami-0601d6b9f96c195f3" ;;
+    us-east-2) AMI_ID="ami-0f79de63fe71ea29d" ;;
+esac
+# g5.12xlarge Qwen2.5-72B per-AZ AMIs (fill + wire in when built):
+#   us-east-1a: ami-xxxxxxxxxxxxxxxxx   us-east-1b: ami-xxxxxxxxxxxxxxxxx
+#   us-east-2a: ami-xxxxxxxxxxxxxxxxx   us-east-2b: ami-xxxxxxxxxxxxxxxxx
 
 # ---------------------------------------------------------------------------
 # SPOT AVAILABILITY CHECK  (--check-spot / --auto-az)
